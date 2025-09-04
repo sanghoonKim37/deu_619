@@ -1,0 +1,91 @@
+void ServoAction() {
+  // (1) BH1750 읽기: TCA9548A 멀티플렉서로 채널 0~3을 선택해 4개 조도 센서를 각각 읽음
+  int topl = readLux(0);     // 좌상(Top-Left) 영역 밝기
+  int topr = readLux(1);     // 우상(Top-Right) 영역 밝기
+  int botl = readLux(2);     // 좌하(Bottom-Left) 영역 밝기
+  int botr = readLux(3);     // 우하(Bottom-Right) 영역 밝기
+
+  // (2) 교수님 변수명으로 직접 대입: L/R/U/D를 BH1750 4분할 센서에서 대응되는 평균으로 계산
+  int L = (topl + botl) / 2;   // 좌측 평균 밝기(왼쪽 두 센서 평균)
+  int R = (topr + botr) / 2;   // 우측 평균 밝기(오른쪽 두 센서 평균)
+  int U = (topl + topr) / 2;   // 상단 평균 밝기(위쪽 두 센서 평균)
+  int D = (botl + botr) / 2;   // 하단 평균 밝기(아래쪽 두 센서 평균)
+
+  // (3) 교수님 코드의 error를 우리 코드의 threshold_value에 매핑
+  const int error = threshold_value;  // 이 값보다 오차가 작으면 움직이지 않음(데드존)
+
+  // (4) 축별/평균 오차 계산
+  int lr_error  = abs(L - R);                     // 좌/우 밝기 차이의 절대값(좌우 축 정렬 정도)
+  int ud_error  = abs(U - D);                     // 상/하 밝기 차이의 절대값(상하 축 정렬 정도)
+  float avg_error = 0.5f * (lr_error + ud_error); // 전체 정렬 상태의 대표값(두 축 평균)
+
+  // (5) 교수님 변수명으로 서보/각도 취득
+  Servo &lr_servo = servo_rightleft;  // 좌우 서보 객체 별칭(교수님 lr_servo)
+  Servo &ud_servo = servo_updown;     // 상하 서보 객체 별칭(교수님 ud_servo)
+  int lr_angle = lr_servo.read();     // 현재 좌우 각도(교수님 lr_angle)
+  int ud_angle = ud_servo.read();     // 현재 상하 각도(교수님 ud_angle)
+
+  // (6) Adaptive step: 평균 오차 대비 비율로 스텝 스케일 결정
+  float ratio = avg_error / (float)error; // 평균 오차가 임계 대비 몇 배인지(환경에 따라 자동 스케일)
+  float step_scale = 0.10f;               // 기본: 작은 오차 구간 → 아주 미세하게 움직임
+  if (ratio > 4.0f)      step_scale = 1.00f; // 큰 오차(빗나감 큼) → 크게 움직여 빠르게 추종
+  else if (ratio > 2.0f) step_scale = 0.50f; // 중간 오차 → 중간 크기 스텝
+
+  // (7) 히스테리시스: ON/OFF 임계 분리로 문턱 주변 흔들림 방지
+  const int TH_ON  = error;                 // 켜짐 문턱: 오차가 이 값보다 커지면 움직임 활성화
+  const int TH_OFF = (int)(error * 0.7f);   // 꺼짐 문턱: 오차가 이 값보다 작아지면 움직임 비활성화
+  static bool lr_active = false, ud_active = false; // 각 축의 활성 상태(프레임 간 유지)
+
+  int diffLR = L - R;   // 좌우 차이의 부호: +면 L이 더 밝음, -면 R이 더 밝음
+  int diffUD = U - D;   // 상하 차이의 부호: +면 U가 더 밝음, -면 D가 더 밝음
+
+  if (abs(diffLR) > TH_ON)       lr_active = true;   // 좌우 오차가 켜짐 문턱 초과 → 좌우 축 활성화
+  else if (abs(diffLR) < TH_OFF) lr_active = false;  // 좌우 오차가 꺼짐 문턱 미만 → 좌우 축 비활성화
+
+  if (abs(diffUD) > TH_ON)       ud_active = true;   // 상하 오차가 켜짐 문턱 초과 → 상하 축 활성화
+  else if (abs(diffUD) < TH_OFF) ud_active = false;  // 상하 오차가 꺼짐 문턱 미만 → 상하 축 비활성화
+
+  // (8) 한 번에 한 축만 움직이기: 두 축 중 더 큰 오차 축만 우선 보정(교차 간섭/헌팅 감소)
+  bool doLR = false, doUD = false;
+  if (lr_active || ud_active) {                         // 둘 중 하나라도 활성화된 경우
+    if (abs(diffUD) >= abs(diffLR)) { doUD = ud_active; doLR = false; } // 상하 오차가 크면 상하만
+    else { doLR = lr_active; doUD = false; }                              // 좌우 오차가 크면 좌우만
+  }
+
+  // (9) 상하 보정(ud_servo, ud_angle): U와 D의 차이에 따라 각도 증감
+  if (doUD) {
+    int move = map(abs(diffUD), TH_ON, max_diff, 1, 10); // 오차 크기를 1~10도의 기본 스텝으로 매핑
+    move = constrain(move, 1, 10);                       // 1~10도 범위로 제한
+    move = (int)(move * step_scale + 0.5f);              // Adaptive 스케일 적용(연속 가변 스텝)
+    if (move < 1) move = 1;                              // 안전: 최소 1도
+
+    // 방향: 기존 장치 기준(네 코드와 동일)
+    if (diffUD > 0 && ud_angle < UPDOWN_MAX)            // U>D: 위쪽이 더 밝다 → 각도 증가(+)
+      ud_angle = min(ud_angle + move, UPDOWN_MAX);      // 상한 넘지 않게 제한
+    else if (diffUD < 0 && ud_angle > UPDOWN_MIN)       // U<D: 아래가 더 밝다 → 각도 감소(-)
+      ud_angle = max(ud_angle - move, UPDOWN_MIN);      // 하한 넘지 않게 제한
+
+    if (ud_angle != ud_servo.read()) ud_servo.write(ud_angle); // 변화 있을 때만 write(불필요 명령/소음↓)
+    // delay(m_speed);  // 지연은 헌팅 유발 → 사용 안 함
+  }
+
+  // (10) 좌우 보정(lr_servo, lr_angle): L과 R의 차이에 따라 각도 증감
+  if (doLR) {
+    int move = map(abs(diffLR), TH_ON, max_diff, 1, 10); // 오차 크기를 1~10도의 기본 스텝으로 매핑
+    move = constrain(move, 1, 10);                       // 1~10도 범위로 제한
+    move = (int)(move * step_scale + 0.5f);              // Adaptive 스케일 적용(연속 가변 스텝)
+    if (move < 1) move = 1;                              // 안전: 최소 1도
+
+    // 방향: 기존 장치 기준(네 코드와 동일)
+    if (diffLR > 0 && lr_angle > RIGHTLEFT_MIN)         // L>R: 왼쪽이 더 밝다 → 각도 감소(-)
+      lr_angle = max(lr_angle - move, RIGHTLEFT_MIN);   // 좌측 하한 넘지 않게 제한
+    else if (diffLR < 0 && lr_angle < RIGHTLEFT_MAX)    // L<R: 오른쪽이 더 밝다 → 각도 증가(+)
+      lr_angle = min(lr_angle + move, RIGHTLEFT_MAX);   // 우측 상한 넘지 않게 제한
+
+    if (lr_angle != lr_servo.read()) lr_servo.write(lr_angle); // 변화 있을 때만 write
+    // delay(m_speed);  // 지연은 사용 안 함
+  }
+
+  // (11) 교수님 "평균오차→resolution 갱신"과 같은 의도는
+  //      여기서 step_scale(1.0/0.5/0.1) + map(1~10)로 이미 구현됨(더 연속적/부드러움).
+}
